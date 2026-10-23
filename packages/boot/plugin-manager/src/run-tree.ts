@@ -28,9 +28,9 @@ export interface RunTreeInternals {
  * Whether one run leads its own process group, which is the target a POSIX
  * liveness probe addresses for the whole tree. A run that captures output is
  * spawned as its own group leader, because its tree is terminated as a unit; a
- * run that inherits the caller's descriptors keeps the caller's group, so an
+ * CLI run keeps the caller's group and stdin, so an
  * interrupt still reaches it.
- * @param execution Whether the run captures output or inherits the caller's descriptors.
+ * @param execution Whether the caller is an interactive CLI or a managed service.
  * @param platform Host platform deciding how a tree is addressed.
  * @returns True when the run leads its own process group.
  */

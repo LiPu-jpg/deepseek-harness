@@ -566,7 +566,7 @@ it('can install without activation and bounds output while retaining the complet
   pnpm.output = '0123456789'
   const outcome = await runProfilePnpm(context, ['add', './extra'], { execution: 'service', outputBytes: 4, activateNewBundles: false })
   expect(outcome).toMatchObject({ exitCode: 0, output: '6789', truncated: true })
-  expect(readFileSync(outcome.logPath, 'utf8')).toBe('0123456789')
+  expect(readFileSync(outcome.logPath, 'utf8')).toBe('dsh: preparing profile package operation\n0123456789')
   expect(readProfileManifest('test', dir).dsh?.profile?.bundles).toEqual([])
   expect(command.run.mock.calls[0]?.[1]).toEqual(['add', join(context.cwd, 'extra')])
 })
@@ -667,7 +667,9 @@ it.each([8192, 30])('refuses to run while a run recorded by an exited operation 
   const outcome = await runProfilePnpm(context, ['add', './extra'], {
     execution: 'service', outputBytes, onOutput: (text) => { messages.push(text) },
   })
-  const diagnostic = readFileSync(outcome.logPath, 'utf8')
+  const logged = readFileSync(outcome.logPath, 'utf8')
+  expect(logged).toMatch(/^dsh: preparing profile package operation\n/)
+  const diagnostic = logged.slice('dsh: preparing profile package operation\n'.length)
   expect(diagnostic).toContain(`process ${String(process.pid)}, started by an earlier package operation whose own process ended, is still running`)
   expect(diagnostic).toContain(`delete ${runRecord(dir)}`)
   expect(messages.join('')).toBe(diagnostic)
@@ -740,7 +742,7 @@ it('terminates a run that stopped printing and reports the silence bound', async
   const outcome = await runProfilePnpm(context, ['add', './extra'], { execution: 'service', outputBytes: 100, idleTimeoutMs: 20 })
   expect(outcome).toMatchObject({ exitCode: 1, timedOut: true })
   expect(outcome.output).toBe('installing\ndsh: pnpm printed nothing for 20ms and was terminated\n')
-  expect(readFileSync(outcome.logPath, 'utf8')).toBe(outcome.output)
+  expect(readFileSync(outcome.logPath, 'utf8')).toBe('dsh: preparing profile package operation\n' + outcome.output)
 })
 
 it('settles a run whose pipes stay open past the process exit', async () => {
@@ -840,7 +842,7 @@ it.each([
   const outcome = await runProfilePnpm(context, ['root'], { execution: 'service', outputBytes: 4, signal: new AbortController().signal })
   expect(outcome.exitCode).toBe(expected)
   expect(outcome.truncated).toBe(true)
-  expect(readFileSync(outcome.logPath, 'utf8')).toBe(shortMessage ?? 'pnpm failed')
+  expect(readFileSync(outcome.logPath, 'utf8')).toBe('dsh: preparing profile package operation\n' + (shortMessage ?? 'pnpm failed'))
 })
 
 it('cancels and settles package output when the output consumer fails', async () => {
@@ -902,16 +904,15 @@ it.each(['cli', 'service'] as const)('uses the %s environment and interaction po
   const options = command.run.mock.calls[0]?.[2] as { env: NodeJS.ProcessEnv; stdin: string; stdout: string; stderr: string }
   for (const name of names) expect(options.env[name]).toBe(execution === 'cli' ? 'fixture-credential' : undefined)
   expect(options.stdin).toBe(execution === 'cli' ? 'inherit' : 'ignore')
-  expect(options.stdout).toBe(execution === 'cli' ? 'inherit' : 'pipe')
-  expect(options.stderr).toBe(execution === 'cli' ? 'inherit' : 'pipe')
+  expect(options.stdout).toBe('pipe')
+  expect(options.stderr).toBe('pipe')
 })
 
-it('settles inherited CLI descriptors without requiring captured streams', async () => {
+it('settles a CLI run with empty captured streams', async () => {
   const { context } = fixture()
-  command.run.mockImplementationOnce(() => Object.assign(
-    Promise.resolve({ exitCode: 0, failed: false }), { stdout: null, stderr: null, nodeChildProcess: new EventEmitter() },
-  ))
-  expect(await runPluginCommand(context, ['approve-builds'], { execution: 'cli', outputBytes: 100 })).toMatchObject({ exitCode: 0, output: '' })
+  command.run.mockImplementationOnce(() => result(0, ''))
+  expect(await runPluginCommand(context, ['approve-builds'], { execution: 'cli', outputBytes: 100 }))
+    .toMatchObject({ exitCode: 0, output: '' })
 })
 
 it('reads the registry pnpm\'s own configuration names in the profile, and answers null for anything but a URL', async () => {
@@ -971,4 +972,15 @@ it('uses application-owned executable arguments and environment for package oper
   expect(command.run).toHaveBeenLastCalledWith(runtime.command,
     [...runtime.args, 'view', 'example', 'name', 'version', 'description', 'dsh', '--json', '--config.fetch-retries=0'],
     expect.objectContaining({ env: expect.objectContaining(runtime.env) as unknown }))
+})
+
+it('persists CLI output and failures while still forwarding them to the terminal', async () => {
+  const { context, pnpm } = fixture()
+  pnpm.output = 'native dependency could not be linked\n'
+  pnpm.exitCode = 1
+  const onOutput = vi.fn()
+  const result = await runProfilePnpm(context, ['install'], { execution: 'cli', outputBytes: 1000, onOutput })
+  expect(result.exitCode).toBe(1)
+  expect(readFileSync(result.logPath, 'utf8')).toContain(pnpm.output)
+  expect(onOutput).toHaveBeenCalledWith(pnpm.output, 'stdout')
 })

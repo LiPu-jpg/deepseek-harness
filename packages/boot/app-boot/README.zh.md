@@ -66,6 +66,8 @@ profile 导入插件前，DSH 会将其声明的 DSH 版本要求与 `getDshRunt
 
 挂载 profile 条目前，`dsh` launcher 会从安装依赖图与有序 bundle 依赖图计算一份不可变的 runtime resolution。普通 Node、打包可执行文件与 Electron Host 等所有 profile 启动器都使用 runtime 解析，将 runtime resolution 安装到 Node 的 ESM 与 CommonJS 解析器中，不创建 fallback 链接。
 
+离线包更新通过 `withProfileUpdateLock` 协调，其同级锁不会随 profile 目录替换而移动。`recordProfileHost` 记录启动外壳的 PID，直至该进程退出；`assertProfileOffline` 拒绝仍存活或无法检查的占用者。`stageProfileUpdate` 复制完整 profile、重定位链接，仅在调用方接受校验结果后替换目录；旧依赖和暂存诊断仍保留在磁盘上。`recoverProfileUpdate` 在启动前完成中断的替换，或恢复旧目录；检测到后续 manifest 编辑时停止自动恢复。调用方在准备、校验、恢复和替换期间持续持有更新锁。安装前会拒绝链接的 profile 根目录、链接的 `node_modules` 根目录，以及外部或链接的虚拟存储。备份必须先恢复至原 profile 路径再使用。这些记录仅协调同一机器上的进程，不支持跨 PID 命名空间共享 profile，也不保证断电持久性。
+
 `sanitizeProfile(binName, profileDir, bundles)` 提供文件恢复，无需加载插件或解析 patch。Desktop 在原生致命错误恢复中调用它。调用前必须停止 profile 并排除并发 profile 写入。它将 profile 的 `cordis.patch.yml` 重命名为带唯一 `.bak-<timestamp>` 后缀的同目录备份，并恢复调用方指定的 bundle 列表，保留已安装包和其他 manifest 字段。时间戳为 Unix 毫秒数；同名备份已存在时追加序号（`-1`、`-2`、……），时间戳保持不变。返回值为备份路径；patch 不存在时返回 `undefined`，缺失的 profile 不会被创建。下次启动的 profile 初始化会重新创建空 patch。home 级 patch 不变。无效 profile JSON 在修改前报错；后续错误向调用方抛出，保留已完成的修改供重试。
 
 ### 预览生效配置

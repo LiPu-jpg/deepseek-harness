@@ -1,9 +1,9 @@
 /** Explicit CLI exemptions use the profile lock and never become pnpm arguments. */
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { expect, it, onTestFinished, vi } from 'vitest'
-import { getDshRuntimeVersion, initProfile, PROFILE_TEMPLATES, readProfileVersionExemptions } from '@deepseek-ai/dsh-app-boot'
+import { getDshRuntimeVersion, initProfile, PROFILE_TEMPLATES, readProfileVersionExemptions, recordProfileHost, withProfileUpdateLock } from '@deepseek-ai/dsh-app-boot'
 import { runPluginCommand, runProfilePnpm } from '@deepseek-ai/dsh-plugin-manager/operations'
 import { runPlugin } from '../src/plugin.ts'
 
@@ -174,4 +174,31 @@ it('applies version approvals to the existing Desktop profile without replacing 
   expect(existsSync(join(dir, 'package.json.lock'))).toBe(false)
   expect(runPluginCommand).not.toHaveBeenCalled()
   expect(runProfilePnpm).not.toHaveBeenCalled()
+})
+
+
+it('refuses Desktop package replacement while its shell is running, including profile case aliases', async () => {
+  const { home } = fixture()
+  const dir = join(home, 'profiles', 'desktop')
+  initProfile(dir, PROFILE_TEMPLATES.web!.bundles)
+  await withProfileUpdateLock(dir, () => recordProfileHost(dir))
+  await expect(runPlugin('Desktop', ['add', 'example-plugin'])).rejects.toMatchObject({ code: 'PROFILE_IN_USE' })
+  expect(runProfilePnpm).not.toHaveBeenCalled()
+})
+
+it('leaves Desktop dependencies unchanged when installation fails in its complete copy', async () => {
+  const { home, stderr } = fixture()
+  const dir = join(home, 'profiles', 'desktop')
+  initProfile(dir, PROFILE_TEMPLATES.web!.bundles)
+  const manifest = readFileSync(join(dir, 'package.json'), 'utf8')
+  vi.mocked(runProfilePnpm).mockImplementation(async (context) => {
+    if (context.dir === undefined) throw new Error('missing staging directory')
+    expect(context.dir).not.toBe(dir)
+    expect(readFileSync(join(context.dir, 'package.json'), 'utf8')).toBe(manifest)
+    writeFileSync(join(context.dir, 'package.json'), '{"partial":true}')
+    return { exitCode: 17, output: 'installer failed', truncated: false, logPath: join(context.dir, 'pnpm.log') }
+  })
+  expect(await runPlugin('desktop', ['add', 'example-plugin'])).toBe(17)
+  expect(readFileSync(join(dir, 'package.json'), 'utf8')).toBe(manifest)
+  expect(stderr.mock.calls.map(call => call[0]).join('')).toContain('-stage-')
 })

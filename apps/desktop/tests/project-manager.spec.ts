@@ -1,4 +1,5 @@
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -329,4 +330,27 @@ describe('desktop link-backend projections', () => {
     expect(lstatSync(join(profile, 'node_modules', 'bridge'), { throwIfNoEntry: false })).toBeUndefined()
     expect(existsSync(join(target, 'package.json'))).toBe(true)
   })
+})
+
+it('records the shell PID so a CLI updater cannot replace its dependencies before process exit', async () => {
+  const { manager } = setup()
+  await manager.applyRelease()
+  expect(readFileSync(join(dirname(manager.paths.profile), '.desktop.host.pid'), 'utf8')).toBe(`${String(process.pid)}\n`)
+})
+
+
+it('recovers a missing Desktop profile before creating its legacy lock directory', async () => {
+  const { manager } = setup()
+  await manager.applyRelease()
+  seedPlugin(manager)
+  const dir = manager.paths.profile
+  const stage = join(dirname(dir), '.desktop-stage-interrupted')
+  mkdirSync(stage)
+  const before = createHash('sha256').update(readFileSync(join(dir, 'package.json'))).digest('hex')
+  writeFileSync(join(dirname(dir), '.desktop.package-update.json'), JSON.stringify({ stage: '.desktop-stage-interrupted', before, after: createHash('sha256').update('next').digest('hex') }))
+  unlinkSync(join(dirname(dir), '.desktop.host.pid'))
+  renameSync(dir, join(stage, 'previous'))
+  await manager.applyRelease()
+  expect(readFileSync(join(dir, 'node_modules/plugin/bundle.yml'), 'utf8')).toBe('[]\n')
+  expect(existsSync(join(dirname(dir), '.desktop.package-update.json'))).toBe(false)
 })

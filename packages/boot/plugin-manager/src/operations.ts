@@ -1,7 +1,7 @@
 /** Shared profile package operations used by dsh plugin and the running manager. */
 import { once } from 'node:events'
 import { existsSync, readFileSync } from 'node:fs'
-import { mkdir, mkdtemp, open, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, open, rm, type FileHandle } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import { execa } from 'execa'
 import type { EntryOptions } from '@deepseek-ai/cordis-plugin-loader'
@@ -10,6 +10,7 @@ import {
   DEFAULT_PROFILE_BUNDLES, bundlePatchPaths, initProfile, PROFILE_TEMPLATES, readProfileManifest,
   resolveBundleDir, resolveProfileDir, loadOverlayPatches, composeEntries, readProfileVersionExemptions,
   evaluatePluginCompatibility, pluginCompatibilityWarning, type ProfileManifest,
+  assertProfileOffline,
 } from '@deepseek-ai/dsh-app-boot'
 import { scrubbedParentEnv } from '@deepseek-ai/dsh-subprocess'
 import { parseInstallSpec } from './install-spec.ts'
@@ -36,7 +37,7 @@ export interface PackageOperationOptions {
   args?: readonly string[]
   /** Application runtime environment, applied only to this package operation. */
   env?: Readonly<Record<string, string>>
-  /** CLI inherits authentication and terminal descriptors; service scrubs secrets and captures output. */
+  /** CLI inherits authentication and stdin; service scrubs secrets. Both modes capture output. */
   execution: 'cli' | 'service'
   signal?: AbortSignal
   outputBytes: number
@@ -141,6 +142,15 @@ async function drainWithin(collectors: readonly Promise<void>[], ms: number): Pr
 
 /** Install commands that take the packages to install as positionals. */
 const INSTALL_COMMANDS = new Set(['add', 'install', 'i'])
+
+/**
+ * Identify dependency queries that do not require an offline replacement.
+ * @param args Pnpm arguments; unrecognized commands conservatively require write access.
+ * @returns True only for the supported read-only package queries.
+ */
+export function isProfilePackageQuery(args: readonly string[]): boolean {
+  return ['list', 'ls', 'why', 'view', 'outdated', 'help'].includes(args.find(argument => !argument.startsWith('-')) ?? '')
+}
 
 /** Bound on a pre-install registry lookup when the caller names none. */
 const LOOKUP_TIMEOUT_MS = 20_000
@@ -279,7 +289,7 @@ function bundleComponentManifests(manifest: ProfileManifest, dir: string, anchor
  * @param args Pnpm arguments, before relative path anchoring.
  * @param options Output, activation and cancellation policy.
  * @returns Exit status, whether the silence bound stopped the run, and the diagnostic path.
- * A compatibility denial returns exit code 1. Service output is bounded; CLI output uses inherited descriptors.
+ * A compatibility denial returns exit code 1. Both output modes capture diagnostics; CLI stdin remains inherited.
  * The diagnostic file is closed on return or rejection, including preparation and spawn failures.
  */
 export async function runProfilePnpm(
@@ -293,9 +303,33 @@ export async function runProfilePnpm(
   const logDir = await mkdtemp(join(logRoot, 'operation-'))
   const logPath = join(logDir, 'pnpm.log')
   await using log = await open(logPath, 'wx', 0o600)
+  await log.write('dsh: preparing profile package operation\n')
+  try {
+    return await executeProfilePnpm(context, args, options, dir, log, logPath, active)
+  } catch (error) {
+    try { await log.write(`dsh: package operation failed: ${String(error)}\n`) } catch (logError) {
+      process.stderr.write(`dsh: package diagnostics could not be saved: ${String(logError)}\n`)
+    }
+    throw error
+  }
+}
+
+/** Execute against the locked profile while the caller owns its diagnostic descriptor. */
+async function executeProfilePnpm(
+  context: PackageOperationContext, args: readonly string[], options: PackageOperationOptions,
+  dir: string, log: FileHandle, logPath: string, active: string | undefined,
+): Promise<PackageResult> {
+  if (options.execution === 'cli' && context.profile.toLowerCase() === 'desktop' && !isProfilePackageQuery(args)) {
+    try { await assertProfileOffline(dir) } catch (error) {
+      const diagnostic = `${String(error)}\n`
+      await log.write(diagnostic)
+      options.onOutput?.(diagnostic, 'stderr')
+      const bytes = Buffer.from(diagnostic)
+      return { exitCode: 1, output: bytes.subarray(Math.max(0, bytes.length - options.outputBytes)).toString('utf8'), truncated: bytes.length > options.outputBytes, logPath }
+    }
+  }
   if (active !== undefined) {
     await log.write(active)
-    await log.close()
     options.onOutput?.(active, 'stderr')
     const bytes = Buffer.from(active)
     return { exitCode: 1, output: bytes.subarray(Math.max(0, bytes.length - options.outputBytes)).toString('utf8'), truncated: bytes.length > options.outputBytes, logPath }
@@ -327,7 +361,6 @@ export async function runProfilePnpm(
     await log.write(diagnostic)
     options.onOutput?.(diagnostic, 'stderr')
     append(Buffer.from(diagnostic))
-    await log.close()
     return { exitCode: 1, output: output.toString('utf8'), truncated, logPath, incompatible }
   }
   // An install command names the packages it adds, so their manifests are read and checked before
@@ -357,8 +390,8 @@ export async function runProfilePnpm(
   const grouped = leadsOwnGroup(options.execution)
   const child = execa(options.command ?? 'pnpm', [...options.args ?? [], ...args.map(arg => anchorPathSpec(arg, context.cwd))], {
     cwd: dir, env: environment, extendEnv: false, reject: false,
-    stdout: options.execution === 'cli' ? 'inherit' : 'pipe',
-    stderr: options.execution === 'cli' ? 'inherit' : 'pipe',
+    stdout: 'pipe',
+    stderr: 'pipe',
     killDescendants: options.execution === 'service',
     buffer: false, stdin: options.execution === 'cli' ? 'inherit' : 'ignore', cancelSignal: options.signal === undefined
       ? cancellation.signal : AbortSignal.any([cancellation.signal, options.signal]),
@@ -375,7 +408,7 @@ export async function runProfilePnpm(
   let idleTimer: NodeJS.Timeout | undefined
   /** The silence bound: a captured run that stops printing without exiting is terminated, never awaited. */
   const armIdle = (): void => {
-    if (control.settled || options.idleTimeoutMs === undefined) return
+    if (control.settled || options.execution === 'cli' || options.idleTimeoutMs === undefined) return
     clearTimeout(idleTimer)
     idleTimer = setTimeout(() => {
       control.stalled = true
@@ -404,14 +437,13 @@ export async function runProfilePnpm(
     }
   }
   const collectors = [
-    ...child.stdout === null ? [] : [collect(child.stdout, 'stdout')],
-    ...child.stderr === null ? [] : [collect(child.stderr, 'stderr')],
+    collect(child.stdout, 'stdout'),
+    collect(child.stderr, 'stderr'),
   ]
   // The drain decides whether a failure surfaces, so each reading is claimed now:
   // an unclaimed rejection would be reported as unhandled while the pipes drain.
   for (const collector of collectors) void collector.catch(() => { /* reported through `failure` and the settled readings */ })
-  // Inherited descriptors hand pnpm the terminal, so there is no captured output
-  // for a silence bound to observe: it would fire on a healthy run.
+  // CLI calls remain operator-controlled; only service calls apply the silence bound.
   if (collectors.length > 0) armIdle()
   let exitCode: number
   try {
@@ -436,8 +468,8 @@ export async function runProfilePnpm(
       // a failure from before the cut still surfaces, and the cut leaves a notice
       // in the log because a classification may read an incomplete tail.
       cut = true
-      child.stdout?.destroy()
-      child.stderr?.destroy()
+      child.stdout.destroy()
+      child.stderr.destroy()
       const notice = 'dsh: pnpm output was cut short after its process exited\n'
       await log.write(notice)
       // A failure from before the cut is the run's own and replaces the notice a
@@ -528,7 +560,6 @@ export async function runProfilePnpm(
     clearTimeout(idleTimer)
     // This process saw the run end, so no successor has to wait for it.
     await rm(runRecordPath(dir), { force: true })
-    await log.close()
   }
   return {
     exitCode, output: output.toString('utf8'), truncated, logPath,
