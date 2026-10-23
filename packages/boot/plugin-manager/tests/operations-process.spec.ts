@@ -160,3 +160,24 @@ it('waits for a run recorded by an exited operation before starting its own', as
   expect(outcome).toMatchObject({ exitCode: 0, output: 'started after\n' })
   expect(existsSync(join(dir, '.plugin-manager', 'run.json'))).toBe(false)
 })
+
+it('captures real CLI stdout and stderr in the diagnostic file', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'manager-cli-log-'))
+  onTestFinished(() => { rmSync(home, { recursive: true, force: true }) })
+  const dir = join(home, 'profiles', 'test')
+  const installAnchor = join(home, 'package.json')
+  writeFileSync(installAnchor, '{}\n')
+  initProfile(dir, [])
+  const installer = join(home, 'installer.cjs')
+  writeFileSync(installer, "process.stdout.write('linking native runtime\\n'); process.stderr.write('native module failure\\n'); process.exitCode = 17")
+  const messages: string[] = []
+  const result = await runProfilePnpm({ home, profile: 'test', installAnchor, cwd: home }, ['install'], {
+    command: process.execPath, args: [installer], execution: 'cli', outputBytes: 1000,
+    onOutput: (text) => { messages.push(text) },
+  })
+  expect(result.exitCode).toBe(17)
+  const log = readFileSync(result.logPath, 'utf8')
+  expect(log).toContain('linking native runtime\n')
+  expect(log).toContain('native module failure\n')
+  expect(messages.join('')).toContain('native module failure\n')
+})

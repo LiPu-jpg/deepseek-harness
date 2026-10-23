@@ -23,7 +23,8 @@ import type { DesktopPaths } from './paths.ts'
 import type { DesktopRelease } from './release.ts'
 import { readDesktopRuntime } from './runtime-tree.ts'
 import {
-  initProfile, PROFILE_TEMPLATES, removeLinkProjections, sanitizeProfile, type ProfileTemplate,
+  initProfile, PROFILE_TEMPLATES, removeLinkProjections, sanitizeProfile, recordProfileHost,
+  recoverProfileUpdate, withProfileUpdateLock, type ProfileTemplate,
 } from '@deepseek-ai/dsh-app-boot'
 
 const PROJECT_NAME = '@deepseek-ai/dsh-desktop-runtime'
@@ -81,9 +82,10 @@ export class DesktopProjectManager {
    * Load application metadata and prepare the external plugin profile without installing packages.
    */
   async applyRelease(): Promise<void> {
-    await this.withLock(() => {
+    await this.withLock(async () => {
       // Validation only: an unreadable or mismatched runtime descriptor stops preparation before the Host starts.
       readDesktopRuntime(this.runtime.dsh)
+      await recordProfileHost(this.paths.profile)
       migrateProfileSettings(this.paths.profile)
       createPluginProfile(this.paths.profile)
       removeLinkProjections(this.paths.profile)
@@ -91,6 +93,13 @@ export class DesktopProjectManager {
   }
 
   private async withLock<T>(operation: () => T | Promise<T>): Promise<T> {
+    return withProfileUpdateLock(this.paths.profile, async () => {
+      await recoverProfileUpdate(this.paths.profile)
+      return this.withLegacyLock(operation)
+    })
+  }
+
+  private async withLegacyLock<T>(operation: () => T | Promise<T>): Promise<T> {
     mkdirSync(this.paths.profile, { recursive: true, mode: 0o700 })
     const lockPath = join(realpathSync(this.paths.profile), 'lock')
     let descriptor: number

@@ -1,11 +1,11 @@
 /** Profile package management and explicit, exact-version compatibility approvals. */
-import { runPluginCommand, runProfilePnpm, setProfileVersionExemption, type PackageOperationOptions } from '@deepseek-ai/dsh-plugin-manager/operations'
+import { runPluginCommand, runProfilePnpm, setProfileVersionExemption, isProfilePackageQuery, type PackageOperationOptions } from '@deepseek-ai/dsh-plugin-manager/operations'
 import { INSTALL_ANCHOR } from './profile-boot.ts'
-import { DEFAULT_PROFILE_BUNDLES, initProfile, PROFILE_TEMPLATES, readProfileCompatibility, resolveProfileDir, type ProfileContext } from '@deepseek-ai/dsh-app-boot'
+import { DEFAULT_PROFILE_BUNDLES, initProfile, PROFILE_TEMPLATES, readProfileCompatibility, resolveProfileDir, recoverProfileUpdate, stageProfileUpdate, withProfileUpdateLock, loadProfileDirectory, type ProfileContext } from '@deepseek-ai/dsh-app-boot'
 import { withFileLock } from '@deepseek-ai/dsh-atomic-write'
 import { existsSync } from 'node:fs'
 import { mkdir } from 'node:fs/promises'
-import { join } from 'node:path'
+import { join, relative } from 'node:path'
 
 function requireDesktopProfile(dir: string): void {
   if (!existsSync(join(dir, 'package.json'))) {
@@ -68,13 +68,18 @@ async function versionCommand(profile: string, args: readonly string[]): Promise
  * @returns Zero on success; nonzero on invalid approval or package-manager failure.
  */
 export async function runPlugin(profile: string, args: readonly string[], packageManager?: ProfileContext['packageManager']): Promise<number> {
-  if (profile === 'desktop') {
+  const desktop = profile.toLowerCase() === 'desktop'
+  if (desktop) profile = 'desktop'
+  if (desktop) {
+    await withProfileUpdateLock(resolveProfileDir(profile), () => recoverProfileUpdate(resolveProfileDir(profile)))
     try { requireDesktopProfile(resolveProfileDir(profile)) } catch (error) {
       process.stderr.write(`dsh: ${String(error)}\n`)
       return 1
     }
   }
-  const versionResult = await versionCommand(profile, args)
+  const versionResult = desktop
+    ? await withProfileUpdateLock(resolveProfileDir(profile), () => versionCommand(profile, args))
+    : await versionCommand(profile, args)
   if (versionResult !== undefined) return versionResult
   const dir = resolveProfileDir(profile)
   if (existsSync(join(dir, 'package.json'))) {
@@ -89,11 +94,24 @@ export async function runPlugin(profile: string, args: readonly string[], packag
     lookupTimeoutMs: 120000,
     onOutput: (text, stream) => { process[stream].write(text) },
   }
-  const result = profile === 'desktop'
-    ? await withFileLock(join(dir, 'package.json'), async () => {
+  const result = desktop
+    ? await withProfileUpdateLock(dir, () => withFileLock(join(dir, 'package.json'), async () => {
       requireDesktopProfile(dir)
-      return runProfilePnpm(context, args, options)
-    }, { waitMs: 120000 })
+      if (isProfilePackageQuery(args)) return runProfilePnpm(context, args, options)
+      const staged = await stageProfileUpdate(dir, async (staging) => {
+        const value = await runProfilePnpm({ ...context, dir: staging }, args, options)
+        if (value.exitCode === 0) {
+          const loaded = loadProfileDirectory('dsh', staging, INSTALL_ANCHOR)
+          if (loaded.skippedBundles.length > 0) {
+            const names = loaded.skippedBundles.map(bundle => bundle.packageName).join(', ')
+            throw new Error(`dsh: staged bundles did not load: ${names}; diagnostics: ${value.logPath}`)
+          }
+        }
+        return { commit: value.exitCode === 0 && value.timedOut !== true, value }
+      })
+      const logPath = staged.committed ? join(dir, relative(staged.staging, staged.value.logPath)) : staged.value.logPath
+      return { ...staged.value, logPath }
+    }, { waitMs: 120000 }), 120000)
     : await runPluginCommand(context, args, options)
   if (result.exitCode === 127) process.stderr.write('dsh: pnpm was not found; install pnpm and make it available on PATH.\n')
   for (const { name, version, runtimeVersion } of result.incompatible ?? []) {
