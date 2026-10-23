@@ -1,0 +1,51 @@
+name: Offline plugin update QA
+
+on:
+  push:
+    branches: [qa/offline-plugin-update]
+
+permissions:
+  contents: read
+
+env:
+  DSH_TELEMETRY_DISABLED: '1'
+
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@v5.0.0
+      - uses: actions/setup-node@v7.0.0
+        with:
+          node-version: '24'
+      - name: Install locked dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Build native addon
+        run: pnpm run build:native-system
+      - name: Verify offline replacement and diagnostics
+        run: >-
+          pnpm exec vitest run
+          packages/boot/app-boot/tests/profile-update.spec.ts
+          packages/boot/app-boot/tests/profile.spec.ts
+          packages/boot/plugin-manager/tests/operations.spec.ts
+          packages/boot/plugin-manager/tests/operation-logs.spec.ts
+          packages/boot/plugin-manager/tests/operations-process.spec.ts
+          apps/cli/tests/plugin.spec.ts
+          apps/desktop/tests/project-manager.spec.ts
+          --reporter=default --reporter=junit --outputFile=offline-plugin-update.junit.xml
+      - uses: actions/upload-artifact@v7.0.1
+        if: always()
+        with:
+          name: offline-plugin-update-${{ matrix.os }}
+          path: offline-plugin-update.junit.xml
+          if-no-files-found: ignore
